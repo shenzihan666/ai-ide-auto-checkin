@@ -1,4 +1,4 @@
-# qoder-cn-auto-checkin Windows 计划任务安装脚本
+﻿# qoder-cn-auto-checkin Windows 计划任务安装脚本
 # 用法：powershell -ExecutionPolicy Bypass -File .\install-windows.ps1
 #
 # 注册任务 QoderCnAutoCheckin：
