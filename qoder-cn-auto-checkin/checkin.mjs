@@ -26,6 +26,7 @@
  */
 
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { spawn, execFileSync } from 'node:child_process';
 import { createDecipheriv } from 'node:crypto';
@@ -64,6 +65,10 @@ let renewNote = ''; // 拼进本次运行汇报
 let runStart = Date.now(); // 续期耗时后重置（见 renewViaApp）
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const nowISO = () => new Date().toISOString();
+const localStamp = () => {
+  const d = new Date(), p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+};
 
 // ---------- 凭据解密 ----------
 
@@ -180,20 +185,64 @@ class ApiError extends Error {
 
 const budgetLeft = () => RUN_BUDGET_MS - (Date.now() - runStart);
 
-function authHeaders(token) {
-  return {
+// ---- 设备身份头：领取（claim）接口的风控校验必需，缺失会返回 401 TOKEN_INVALID ----
+// machineToken/machineCode/machineType 来自客户端自带的原生风控程序 runtime-info.exe
+const RUNTIME_INFO_CANDIDATES = [
+  process.env.QODERCN_RUNTIME_INFO,
+  path.join(process.env.LOCALAPPDATA || '', 'Programs', 'Qoder CN', 'resources', 'umid', 'runtime-info.exe'),
+  'C:\\Program Files\\Qoder CN\\resources\\umid\\runtime-info.exe',
+].filter(Boolean);
+
+let machineIdentityCache;
+function resolveMachineIdentity(account) {
+  if (machineIdentityCache !== undefined) return machineIdentityCache;
+  const ident = {};
+  try {
+    ident.machineId = fs.readFileSync(path.join(os.homedir(), '.qoder-cn', '.auth', 'machine_id'), 'utf-8').trim() || undefined;
+  } catch { /* 可选 */ }
+  try {
+    ident.version = JSON.parse(fs.readFileSync(path.join(os.homedir(), '.qoder-cn', '.qoder-app-status.json'), 'utf-8')).version;
+  } catch { /* 可选 */ }
+  const exe = RUNTIME_INFO_CANDIDATES.find((p) => fs.existsSync(p));
+  if (exe) {
+    try {
+      const out = execFileSync(exe, ['prod', '--account-stdin'], {
+        input: Buffer.from(JSON.stringify({ account: account || '' }) + ' '),
+        encoding: 'utf8', timeout: 30_000, windowsHide: true,
+      });
+      const ri = JSON.parse(out.split(' ')[0]);
+      if (ri.machineToken) ident.machineToken = ri.machineToken;
+      if (ri.machineCode) ident.machineCode = ri.machineCode;
+      if (ri.machineType) ident.machineType = ri.machineType;
+    } catch { /* 解不开则不带设备头，claim 可能被拒 */ }
+  }
+  machineIdentityCache = ident;
+  return ident;
+}
+
+function authHeaders(token, account) {
+  const h = {
     Accept: 'application/json',
     Authorization: `Bearer ${token}`,
     'Cosy-ClientType': '10',
     'User-Agent': 'Qoder',
+    'Cosy-MachineOS': 'x86_64_win32',
+    'Cosy-MachineHostname': os.hostname(),
   };
+  const id = resolveMachineIdentity(account);
+  if (id.version) h['Cosy-Version'] = id.version;
+  if (id.machineId) h['Cosy-MachineId'] = id.machineId;
+  if (id.machineToken) h['Cosy-MachineToken'] = id.machineToken;
+  if (id.machineCode) h['Cosy-MachineCode'] = id.machineCode;
+  if (id.machineType) h['Cosy-MachineType'] = id.machineType;
+  return h;
 }
 
-async function request(token, url, method = 'GET') {
+async function request(token, url, method = 'GET', account) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), Math.min(REQUEST_TIMEOUT_MS, Math.max(1, budgetLeft())));
   try {
-    const res = await fetch(url, { method, headers: authHeaders(token), signal: ctrl.signal });
+    const res = await fetch(url, { method, headers: authHeaders(token, account), signal: ctrl.signal });
     const text = await res.text();
     let data; try { data = JSON.parse(text); } catch { data = undefined; }
     if (!res.ok) throw new ApiError(res.status, data ?? text.slice(0, 200));
@@ -204,11 +253,11 @@ async function request(token, url, method = 'GET') {
   } finally { clearTimeout(timer); }
 }
 
-async function requestRetry(token, url, method, retries) {
+async function requestRetry(token, url, method, retries, account) {
   let lastErr;
   for (let i = 0; i <= retries; i++) {
     if (i > 0) await sleep(RETRY_DELAYS[Math.min(i - 1, RETRY_DELAYS.length - 1)]);
-    try { return await request(token, url, method); }
+    try { return await request(token, url, method, account); }
     catch (e) {
       if (e instanceof ApiError) throw e;
       lastErr = e;
@@ -232,29 +281,29 @@ const describeBenefit = (c) => {
   return b.kind === 'CREDITS' ? `${b.amount ?? '?'} Credits` : `${b.kind || '权益'}${b.amount ? ` ${b.amount}` : ''}`;
 };
 
-async function listCampaigns(token) {
-  const d = await requestRetry(token, OPENAPI_BASE + CAMPAIGNS_PATH, 'GET', LIST_RETRIES);
+async function listCampaigns(token, account) {
+  const d = await requestRetry(token, OPENAPI_BASE + CAMPAIGNS_PATH, 'GET', LIST_RETRIES, account);
   if (!d || !Array.isArray(d.campaigns) && !Array.isArray(d?.data?.campaigns)) {
     throw new Error(`活动列表返回格式异常：${JSON.stringify(d).slice(0, 200)}`);
   }
   return d;
 }
 
-async function claimOne(token, c) {
+async function claimOne(token, c, account) {
   const url = `${OPENAPI_BASE}${CAMPAIGNS_PATH}/${encodeURIComponent(c.campaignId)}/claim`;
   try {
-    const r = await requestRetry(token, url, 'POST', CLAIM_RETRIES);
+    const r = await requestRetry(token, url, 'POST', CLAIM_RETRIES, account);
     if (r?.status === 'CLAIMED' || r?.replayed === true) {
       return { ok: true, replayed: !!r?.replayed, name: describeBenefit(c) };
     }
     // 响应异常 → 复核
-    const after = await listCampaigns(token);
+    const after = await listCampaigns(token, account);
     const still = claimableOf(after).some((x) => x.campaignId === c.campaignId);
     if (!still) return { ok: true, replayed: false, name: describeBenefit(c) };
     return { ok: false, name: describeBenefit(c), err: `领取响应异常：${JSON.stringify(r).slice(0, 150)}` };
   } catch (e) {
     if (e instanceof NetworkError) throw e;
-    const after = await listCampaigns(token).catch(() => undefined);
+    const after = await listCampaigns(token, account).catch(() => undefined);
     const still = after ? claimableOf(after).some((x) => x.campaignId === c.campaignId) : true;
     if (!still) return { ok: true, replayed: false, name: describeBenefit(c) };
     const msg = e instanceof ApiError ? `HTTP ${e.status} ${typeof e.body === 'object' ? JSON.stringify(e.body) : e.body}` : e.message;
@@ -263,7 +312,8 @@ async function claimOne(token, c) {
 }
 
 async function cmdAuto(auth) {
-  const list = await listCampaigns(auth.token);
+  const account = auth.user?.id;
+  const list = await listCampaigns(auth.token, account);
   const todo = claimableOf(list);
   if (todo.length === 0) {
     return { result: 'ALREADY', report: '今日无可领取的活动（已领完或暂无活动）', exit: 0 };
@@ -271,7 +321,7 @@ async function cmdAuto(auth) {
   const results = [];
   for (const c of todo) {
     if (budgetLeft() < 5_000) { results.push({ ok: false, name: describeBenefit(c), err: '时间预算耗尽，留待下次' }); break; }
-    results.push(await claimOne(auth, c));
+    results.push(await claimOne(auth.token, c, account));
   }
   const okAll = results.every((r) => r.ok);
   const got = results.filter((r) => r.ok).map((r) => r.name);
@@ -286,7 +336,7 @@ async function cmdAuto(auth) {
 }
 
 async function cmdStatus(auth) {
-  const list = await listCampaigns(auth.token);
+  const list = await listCampaigns(auth.token, auth.user?.id);
   const todo = claimableOf(list);
   const campaigns = (list?.campaigns || list?.data?.campaigns || []);
   const lines = campaigns.map((c) => `${c.campaignKey}: ${c.actionType}/${c.claimStatus}${c.benefit?.kind === 'CREDITS' ? ` (${c.benefit.amount} Credits)` : ''}`);
@@ -320,7 +370,7 @@ function cmdDoctor(auth) {
 // ---------- 输出 ----------
 
 function appendLog(line) {
-  try { fs.appendFileSync(LOG_FILE, `[${nowISO().replace('T', ' ').slice(0, 19)}] ${line}\n`, 'utf-8'); }
+  try { fs.appendFileSync(LOG_FILE, `[${localStamp()}] ${line}\n`, 'utf-8'); }
   catch { /* 日志写不进去不视为签到失败 */ }
 }
 

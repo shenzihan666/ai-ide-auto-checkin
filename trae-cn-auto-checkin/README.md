@@ -20,7 +20,8 @@ WorkBuddy 项目证明了更稳的路子：客户端再怎么改 UI，底层的*
 | `POST {host}/trae/api/v2/ug/checkin_credits/claim` | 领取，body `{req_source: 1}`（1=Trae IDE，2=SOLO） |
 
 - `host` = `https://api.trae.cn`（存在凭据 JSON 的 `host` 字段，不写死）
-- 请求头：`Content-Type: application/json` + **`Authorization: Cloud-IDE-JWT <token>`**（注意不是 Bearer）
+- 请求头：`Content-Type: application/json` + **`Authorization: Cloud-IDE-JWT <token>`**（注意不是 Bearer）+ **`x-device-id`**（必须）+ `x-user-id` + `X-User-Region: CN`
+- **`x-device-id` 必须是服务端签发的真实设备号**：从 storage.json 的键名 `iCubeAuthInfo://icube-dc:<id>` 取。错误代价：缺失 → 9004（参数错误）；假的/服务端不认的值 → **9074**（文案误导性地写成"当前参与用户太多"）。实测 machineid 文件、telemetry.machineId 等"看起来合法"的本地 ID 全部 9074，换 icube-dc 设备号后第一次调用即成功
 - 幂等性：`checked_in` 为准；已签状态下重复 claim 服务端返回业务码 9004，不会重复发积分 → status 失败重试、claim 网络错误重试 1 次都是安全的
 - 门槛：仅 `account.scope === "marscode"`（CN 个人版账号）开放签到
 
@@ -77,6 +78,7 @@ node checkin.mjs silent     # 同 auto，结果写 checkin.log（计划任务用
 |---|---|
 | `SUCCESS` | 本次真实领取成功 |
 | `ALREADY` | 今日已签，无需操作 |
+| `SERVER_BUSY` | 领取返回 9074：多为设备号未被服务端认可（偶发限流），等下一次自动运行 |
 | `INACTIVE` | 签到活动未开启（服务端 `enable:false`） |
 | `AUTH_EXPIRED` | token 过期，打开一次 Trae CN 自动续期 |
 | `NO_AUTH / NO_SESSION / DECRYPT_FAILED` | 本地凭据问题（未登录过/文件损坏） |
@@ -92,26 +94,27 @@ node checkin.mjs silent     # 同 auto，结果写 checkin.log（计划任务用
 powershell -ExecutionPolicy Bypass -File .\install-windows.ps1
 ```
 
-注册任务 `TraeCnAutoCheckin`：
+注册任务 `TraeCnAutoCheckin`，三个触发器：
 
-- **每天 00:05** 签到一次（服务端按北京时间切日，00:05 恰在新一天）
-- **每次用户登录补跑** + `StartWhenAvailable`：错过 00:05（关机/睡眠）后开机自动补签，不断连
-- 经 `wscript + checkin-silent.vbs` 零闪窗运行，日志追加到 `checkin.log`（UTF-8；用 `Get-Content -Encoding UTF8` 或 VS Code 查看）
+- **每天 00:05** 签到（服务端按北京时间切日）
+- **每 2 小时补跑**：9074/网络失败等活动日内自愈，已签时只是一次只读查询
+- **每次用户登录补跑** + `StartWhenAvailable`：错过 00:05（关机/睡眠）后开机自动补签
+
+经 `wscript + checkin-silent.vbs` 零闪窗运行，日志追加到 `checkin.log`（**本地时间**，UTF-8；用 `Get-Content -Encoding UTF8` 或 VS Code 查看）。
 
 卸载：`powershell -ExecutionPolicy Bypass -File .\uninstall-windows.ps1`（只删任务，不动凭据与日志）。
 
 > 移动项目目录或更换 node 安装位置后，重跑一次 install（VBS 里烘焙了绝对路径）。
 
-## 五、验证记录（2026-10-03）
+## 五、验证记录
 
-| 验证项 | 结果 |
-|---|---|
-| 解密 storage.json 凭据 | ✅ 校验头匹配，UserInfo 字段齐全 |
-| status 接口 | ✅ 200 `{checked_in:true, credits:100, enable:true}` |
-| claim 幂等性（已签状态下重复领） | ✅ 服务端拒发（9004），积分不重复 |
-| doctor / status / auto / silent 四模式 | ✅ 输出符合预期（auto 正确识别 ALREADY） |
-| 计划任务端到端（wscript→VBS→node→日志） | ✅ LastTaskResult=0，日志落盘 |
-| 首次真实领取 | 待 10/04 00:05 首签验证（脚本对成功响应字段做了防御式解析） |
+| 日期 | 验证项 | 结果 |
+|---|---|---|
+| 10-03 | 解密 storage.json 凭据 | ✅ 校验头匹配，UserInfo 字段齐全 |
+| 10-03 | status 接口 / claim 幂等性 | ✅ 已签状态下重复领被拒（9004），积分不重复 |
+| 10-03 | doctor / status / auto / silent、计划任务端到端 | ✅ LastTaskResult=0 |
+| 10-04 | **事故：00:05 自动签到失败（9004）** | 根因：请求缺 `x-device-id`；补上后发现本地 ID 均不被认（9074） |
+| 10-04 | **修复：改用 `iCubeAuthInfo://icube-dc:<id>` 设备号** + `x-user-id` + `X-User-Region` | ✅ 当日 100 积分补领成功（`code:0, checked_in:true`），doctor 新增设备号检查 |
 
 ## 六、已知限制
 

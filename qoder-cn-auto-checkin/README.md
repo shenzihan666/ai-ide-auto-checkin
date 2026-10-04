@@ -19,7 +19,7 @@ Qoder CN（阿里 AI IDE）启动时弹出的"**专属活动权益，立即查�
 
 - `openapi` = `https://openapi.qoder.com.cn`（来自 `~/.qoder-cn/.cache/endpoint-cache.json`）
 - 每日签到即列表里 `actionType=CLAIM_BENEFIT && claimStatus=CLAIMABLE && benefit.kind=CREDITS` 的活动
-- 请求头：`Authorization: Bearer <token>` + **`Cosy-ClientType: 10`** + `Accept: application/json` + `User-Agent: Qoder`（`Cosy-*` 系列设备头可选，实测不需要）
+- 请求头：`Authorization: Bearer <token>` + **`Cosy-ClientType: 10`** + `Accept: application/json` + `User-Agent: Qoder`，外加**设备身份头**（与官方 webRequest 注入一致）：`Cosy-MachineOS: x86_64_win32`、`Cosy-MachineHostname`、`Cosy-MachineId`（`~/.qoder-cn/.auth/machine_id`）、`Cosy-Version`，以及 `Cosy-MachineToken/Code/Type`——三者由客户端自带的风控程序 `resources\umid\runtime-info.exe <prod> --account-stdin`（stdin 喂 `{"account":<uid>}`）实时生成，脚本会自动调用
 - 幂等：服务端 `replayed` 防重放，重复 claim 不会重复发放；`claimStatus` 为准
 
 ### 2.2 登录态存储与解密
@@ -87,21 +87,20 @@ node checkin.mjs silent     # 同 auto，结果写 checkin.log（计划任务用
 powershell -ExecutionPolicy Bypass -File .\install-windows.ps1
 ```
 
-注册任务 `QoderCnAutoCheckin`：每天 **00:10** + 每次登录补跑 + `StartWhenAvailable`（错过自动补，不断领），`wscript + checkin-silent.vbs` 零闪窗，日志 `checkin.log`。
+注册任务 `QoderCnAutoCheckin`，三个触发器：每天 **00:10** + **每 2 小时补跑**（当天的 Credits 活动往往上午才发布，00:10 常查不到，靠补跑轮询领到）+ 每次登录补跑，`StartWhenAvailable` 错过自动补。`wscript + checkin-silent.vbs` 零闪窗，日志 `checkin.log`（本地时间，UTF-8）。
 
 卸载：`powershell -ExecutionPolicy Bypass -File .\uninstall-windows.ps1`。
 
 > 移动项目目录或更换 node 位置后重跑 install（VBS 里烘焙了绝对路径）。与 Trae CN 任务错开 5 分钟（00:05/00:10），互不干扰。
 
-## 五、验证记录（2026-10-03）
+## 五、验证记录
 
-| 验证项 | 结果 |
-|---|---|
-| auth.v1.dat 解密（DPAPI + AES-256-GCM） | ✅ 得到 token/refreshToken/user |
-| campaigns 列表 | ✅ 200，识别出 CLAIMABLE 的 100 Credits 活动 |
-| **真实领取** | ✅ `POST .../claim` → `{status:"CLAIMED", benefit:{amount:100}}`，复核 `claimStatus=CLAIMED`，**当日 100 Credits 到账** |
-| doctor / status / auto / silent | ✅ 领取后 auto 正确返回 ALREADY |
-| 计划任务端到端（wscript→VBS→node→PS 子进程→日志） | ✅ LastTaskResult=0 |
+| 日期 | 验证项 | 结果 |
+|---|---|---|
+| 10-03 | auth.v1.dat 解密（DPAPI + AES-256-GCM）/ campaigns 列表 | ✅ |
+| 10-03 | **真实领取** | ✅ `POST .../claim` → `{status:"CLAIMED", benefit:{amount:100}}`，当日 100 Credits 到账 |
+| 10-04 | 事故：开机补跑领取 401 TOKEN_INVALID | 双因：脚本 claim 传参 bug（把 auth 对象当 token）+ 补齐官方设备身份头（runtime-info.exe）后修复，当日 Credits 已领 |
+| 10-04 | doctor / status / auto / silent、计划任务端到端 | ✅ LastTaskResult=0 |
 
 ## 六、已知限制
 

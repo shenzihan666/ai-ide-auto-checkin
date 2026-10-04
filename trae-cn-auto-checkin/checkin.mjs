@@ -52,6 +52,14 @@ const AUTH_KEY_DEFAULT = 'iCubeAuthInfo://icube.cloudide';
 const LOG_FILE = process.env.TRAECN_CHECKIN_LOG ||
   path.join(import.meta.dirname || process.cwd(), 'checkin.log');
 
+// 设备/用户头：领取接口（下单）校验必需。
+// x-device-id 必须是服务端签发的真实设备号（storage.json 键 iCubeAuthInfo://icube-dc:<id>），
+// 假值/缺失分别返回 9074（文案误导为"人太多"）与 9004。
+function resolveDeviceIdFromStorage(storage) {
+  const key = Object.keys(storage).find((k) => k.startsWith('iCubeAuthInfo://icube-dc:'));
+  return key ? key.split('icube-dc:')[1] : undefined;
+}
+
 // ---- token 失效自动恢复：启动 Trae CN 让其续期，完成后关闭 ----
 const APP_IMAGE = 'Trae CN.exe';
 const APP_EXE_CANDIDATES = [
@@ -68,7 +76,10 @@ let renewNote = ''; // 拼进本次运行汇报
 let runStart = Date.now(); // 续期耗时后重置（见 renewViaApp）
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const sha512 = (b) => createHash('sha512').update(b).digest();
-const nowISO = () => new Date().toISOString();
+const localStamp = () => {
+  const d = new Date(), p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+};
 
 // ---------- 凭据解密 ----------
 
@@ -111,6 +122,7 @@ function loadUserInfo() {
 
   const candidates = [AUTH_KEY_DEFAULT,
     ...Object.keys(storage).filter((k) => k.startsWith('iCubeAuthInfo://') && k !== AUTH_KEY_DEFAULT)];
+  const deviceId = process.env.TRAECN_DEVICE_ID || resolveDeviceIdFromStorage(storage);
   const errs = [];
   for (const key of candidates) {
     const v = storage[key];
@@ -119,7 +131,7 @@ function loadUserInfo() {
     try { user = JSON.parse(decryptEnvelope(v)); }
     catch (e) { errs.push(`${key}: ${e.detail}`); continue; }
     if (user && typeof user.token === 'string' && typeof user.host === 'string') {
-      return { ...user, _key: key };
+      return { ...user, _key: key, _deviceId: deviceId };
     }
   }
   throw new CredentialError('NO_SESSION',
@@ -194,13 +206,21 @@ class ApiError extends Error {
 
 function budgetLeft() { return RUN_BUDGET_MS - (Date.now() - runStart); }
 
-async function postJson(url, token, body, { timeout = REQUEST_TIMEOUT_MS } = {}) {
+function buildHeaders(user) {
+  const h = { 'Content-Type': 'application/json', 'Authorization': `Cloud-IDE-JWT ${user.token}` };
+  if (user._deviceId) h['x-device-id'] = user._deviceId;
+  if (user.userId) h['x-user-id'] = String(user.userId);
+  h['X-User-Region'] = user.userRegion?.region || 'CN';
+  return h;
+}
+
+async function postJson(url, user, body, { timeout = REQUEST_TIMEOUT_MS } = {}) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), Math.min(timeout, Math.max(1, budgetLeft())));
   try {
     const res = await fetch(url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': `Cloud-IDE-JWT ${token}` },
+      headers: buildHeaders(user),
       body: JSON.stringify(body),
       signal: ctrl.signal,
     });
@@ -214,11 +234,11 @@ async function postJson(url, token, body, { timeout = REQUEST_TIMEOUT_MS } = {})
   } finally { clearTimeout(timer); }
 }
 
-async function postJsonRetry(url, token, body, retries) {
+async function postJsonRetry(url, user, body, retries) {
   let lastErr;
   for (let i = 0; i <= retries; i++) {
     if (i > 0) await sleep(RETRY_DELAYS[Math.min(i - 1, RETRY_DELAYS.length - 1)]);
-    try { return await postJson(url, token, body); }
+    try { return await postJson(url, user, body); }
     catch (e) {
       if (e instanceof ApiError) throw e; // 业务/HTTP 状态错误不重试
       lastErr = e;
@@ -231,11 +251,11 @@ async function postJsonRetry(url, token, body, retries) {
 // ---------- 业务 ----------
 
 async function fetchStatus(user) {
-  return postJsonRetry(user.host + STATUS_PATH, user.token, { req_source: REQ_SOURCE_DEFAULT }, STATUS_RETRIES);
+  return postJsonRetry(user.host + STATUS_PATH, user, { req_source: REQ_SOURCE_DEFAULT }, STATUS_RETRIES);
 }
 
 async function claimCredits(user) {
-  return postJsonRetry(user.host + CLAIM_PATH, user.token, { req_source: REQ_SOURCE_DEFAULT }, CLAIM_RETRIES);
+  return postJsonRetry(user.host + CLAIM_PATH, user, { req_source: REQ_SOURCE_DEFAULT }, CLAIM_RETRIES);
 }
 
 function validateStatus(d) {
@@ -278,6 +298,14 @@ async function doClaim(user) {
     const msg = e instanceof ApiError ? `HTTP ${e.status} ${(typeof e.body === 'object' ? JSON.stringify(e.body) : e.body)}` : e.message;
     return { result: 'CLAIM_REJECTED', report: `领取请求被服务端拒绝：${msg}`, needs_attention: true, exit: 1 };
   }
+  // 9074 = 服务端繁忙/限流（官方文案"当前参与用户太多，请稍后再试"），30 秒后重试一次
+  if (claim?.code === 9074) {
+    await sleep(30_000);
+    claim = await claimCredits(user).catch(() => claim);
+  }
+  if (claim?.code === 9074) {
+    return { result: 'SERVER_BUSY', report: '领取未成功（9074）：多为设备号未被服务端认可（偶发限流），等待下一次自动运行重试', detail: { claim_code: 9074 }, exit: 0 };
+  }
   // claim 正常返回后，再查一次状态拿积分口径（成功响应字段未在文档中，保守复核）
   const after = await fetchStatus(user).catch(() => undefined);
   const credits = claim?.credits ?? after?.credits;
@@ -305,6 +333,7 @@ function cmdDoctor(user) {
     const exp = Date.parse(user.expiredAt || '');
     push('token 未过期', Number.isFinite(exp) && exp > Date.now(), `过期时间 ${fmtExpiry(user.expiredAt)} UTC`);
     push('API host', /^https?:\/\//.test(user.host), user.host);
+    push('设备号(icube-dc)', !!user._deviceId, user._deviceId || 'storage.json 中未找到 iCubeAuthInfo://icube-dc:<id>，领取会返回 9074');
   }
   const allOk = checks.every((c) => c.ok);
   return {
@@ -318,7 +347,7 @@ function cmdDoctor(user) {
 // ---------- 输出 ----------
 
 function appendLog(line) {
-  try { fs.appendFileSync(LOG_FILE, `[${new Date().toISOString().replace('T', ' ').slice(0, 19)}] ${line}\n`, 'utf-8'); }
+  try { fs.appendFileSync(LOG_FILE, `[${localStamp()}] ${line}\n`, 'utf-8'); }
   catch { /* 日志写不进去不视为签到失败 */ }
 }
 

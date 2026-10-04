@@ -44,11 +44,12 @@ Write-Host "[OK] VBS: $Vbs"
 # ---- 注册计划任务 ----
 $action    = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument "`"$Vbs`""
 $trigger1  = New-ScheduledTaskTrigger -Daily -At '00:10'
-$trigger2  = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+$trigger2  = New-ScheduledTaskTrigger -Once -At (Get-Date).AddHours(2) -RepetitionInterval (New-TimeSpan -Hours 2) -RepetitionDuration (New-TimeSpan -Days 365)  # 每 2 小时补跑（活动未发布/网络失败自愈）
+$trigger3  = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
 $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
              -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 10) -MultipleInstances IgnoreNew
 Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
-Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger @($trigger1, $trigger2) `
+Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger @($trigger1, $trigger2, $trigger3) `
     -Settings $settings -Description 'Qoder CN 每日自动领取 Credits，结果见项目目录 checkin.log' | Out-Null
 
 $info = Get-ScheduledTask -TaskName $TaskName
